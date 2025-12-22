@@ -85,7 +85,8 @@ export function deleteMessage(id: number, author: string): boolean {
 
 // Nonce management
 function generateAlphanumericNonce(length = 16): string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+	const chars =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 	const bytes = crypto.getRandomValues(new Uint8Array(length));
 	return Array.from(bytes, (b) => chars[b % chars.length]).join("");
 }

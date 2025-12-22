@@ -55,6 +55,30 @@ A web app for storing personal messages with Ethereum wallet authentication usin
 
 ## Authentication Flow
 
+```mermaid
+sequenceDiagram
+    participant User
+    participant App
+    participant Wallet
+    participant Server
+
+    User->>App: Connect wallet
+    App->>Wallet: Request connection
+    Wallet-->>App: Connected (address)
+    App->>Server: GET /api/auth/nonce
+    Server-->>App: { nonce }
+    App->>App: Build SIWE message
+    App->>Wallet: Sign message
+    Wallet->>User: Approve signature?
+    User->>Wallet: Approve
+    Wallet-->>App: signature
+    App->>Server: POST /api/auth/token { message, signature }
+    Server->>Server: Verify signature (EOA/EIP-1271)
+    Server-->>App: { access_token, expires_in }
+    App->>Server: GET /api/messages (Bearer token)
+    Server-->>App: messages[]
+```
+
 1. User connects wallet (MetaMask, etc.)
 2. App switches to Ethereum mainnet
 3. App fetches a nonce from `/api/auth/nonce`
@@ -67,6 +91,27 @@ A web app for storing personal messages with Ethereum wallet authentication usin
 ## Discoverable OAuth Flow (EIP-4361)
 
 For server-to-server API access, the `/api/authors/:address/messages` endpoint implements discoverable OAuth per the draft specification:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Wallet
+    participant Server
+
+    Client->>Server: GET /api/authors/:address/messages
+    Server-->>Client: 401 + WWW-Authenticate header
+    Note right of Client: Parse challenge:<br/>scope, token_uri,<br/>chain_id, signing_scheme
+    Client->>Server: GET /api/auth/nonce
+    Server-->>Client: { nonce }
+    Client->>Client: Build SIWE message with scopes
+    Client->>Wallet: Sign message
+    Wallet-->>Client: signature
+    Client->>Server: POST /api/auth/token<br/>{ grant_type: "eth_signature",<br/>message, signature, scope }
+    Server->>Server: Verify signature & scopes
+    Server-->>Client: { access_token, scope }
+    Client->>Server: GET /api/authors/:address/messages<br/>(Bearer token)
+    Server-->>Client: { author, messages[] }
+```
 
 1. Client requests the endpoint without authentication
 2. Server responds with `401 Unauthorized` and `WWW-Authenticate` header:
