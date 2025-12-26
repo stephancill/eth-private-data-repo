@@ -312,12 +312,11 @@ export function createKeyValueAuthMiddleware(
 			);
 		}
 
-		// Check if token has the required scope OR if requester is the owner
-		const tokenScopes = payload.scope ? payload.scope.split(" ") : [];
+		// Private keys can only be read by the owner
+		// Read scopes are for declaring intent, but do not grant cross-user access
 		const isOwner = payload.address.toLowerCase() === ownerAddress;
-		const hasRequiredScope = tokenScopes.includes(requiredScope);
 
-		if (!hasRequiredScope && !isOwner) {
+		if (!isOwner) {
 			const challenge = generateWWWAuthenticateChallenge(c, `kv-${key}`, [
 				requiredScope,
 			]);
@@ -325,12 +324,14 @@ export function createKeyValueAuthMiddleware(
 			return c.json(
 				{
 					error: "insufficient_scope",
-					error_description: `Required scope: ${requiredScope}`,
+					error_description:
+						"Cannot read private keys for other addresses",
 				},
 				403,
 			);
 		}
 
+		const tokenScopes = payload.scope ? payload.scope.split(" ") : [];
 		c.set("address", payload.address);
 		c.set("chainId", payload.chainId);
 		c.set("scopes", tokenScopes);

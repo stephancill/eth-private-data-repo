@@ -163,6 +163,96 @@ describe("Key-Value API", () => {
 			const body = await res.json();
 			expect(body.error).toBe("invalid_token");
 		});
+
+		it("returns 403 when trying to read another address's private key", async () => {
+			// Owner's address (Bob)
+			const owner = "0xb0b0000000000000000000000000000000000000";
+			mockKeyValues.set(`${owner.toLowerCase()}:settings`, {
+				value: JSON.stringify({ theme: "dark" }),
+				is_public: 0,
+			});
+
+			// Get a token for Alice's address (different from owner)
+			const aliceMessage = `localhost wants you to sign in with your Ethereum account:
+0xa11ce00000000000000000000000000000000000
+
+Sign in to access your data.
+
+URI: http://localhost:3000
+Version: 1
+Chain ID: 1
+Nonce: validnonce10001
+Issued At: 2025-12-22T07:15:00Z
+Resources:
+- urn:oauth:scope:settings:read`;
+
+			const tokenResult = await exchangeToken(
+				{
+					message: aliceMessage,
+					signature: "0xvalid",
+				},
+				[SCOPES.KV_WRITE],
+			);
+
+			expect("error" in tokenResult).toBe(false);
+			if ("error" in tokenResult) return;
+
+			// Alice tries to read Bob's private key using her token
+			const res = await app.request(`/user/${owner}/settings`, {
+				headers: {
+					Authorization: `Bearer ${tokenResult.token}`,
+				},
+			});
+
+			expect(res.status).toBe(403);
+
+			const body = await res.json();
+			expect(body.error).toBe("insufficient_scope");
+			expect(body.error_description).toContain("other addresses");
+		});
+
+		it("allows owner to read their own private key", async () => {
+			// Token address matches owner address
+			const owner = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+			mockKeyValues.set(`${owner.toLowerCase()}:settings`, {
+				value: JSON.stringify({ theme: "dark" }),
+				is_public: 0,
+			});
+
+			const ownerMessage = `localhost wants you to sign in with your Ethereum account:
+0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
+
+Sign in to access your data.
+
+URI: http://localhost:3000
+Version: 1
+Chain ID: 1
+Nonce: validnonce10002
+Issued At: 2025-12-22T07:15:00Z`;
+
+			const tokenResult = await exchangeToken(
+				{
+					message: ownerMessage,
+					signature: "0xvalid",
+				},
+				[SCOPES.KV_WRITE],
+			);
+
+			expect("error" in tokenResult).toBe(false);
+			if ("error" in tokenResult) return;
+
+			// Owner reads their own private key
+			const res = await app.request(`/user/${owner}/settings`, {
+				headers: {
+					Authorization: `Bearer ${tokenResult.token}`,
+				},
+			});
+
+			expect(res.status).toBe(200);
+
+			const body = await res.json();
+			expect(body).toEqual({ theme: "dark" });
+		});
 	});
 });
 
