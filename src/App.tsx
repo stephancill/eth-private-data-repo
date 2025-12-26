@@ -306,7 +306,7 @@ function App() {
 								</small>
 							</div>
 							<pre style={{ marginBottom: 8 }}>{formatValue(entry.value)}</pre>
-							{entry.isPublic && address && (
+							{address && (
 								<div
 									style={{ marginBottom: 8, fontSize: "0.85em", opacity: 0.6 }}
 								>
