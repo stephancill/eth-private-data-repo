@@ -1,11 +1,13 @@
 # Private Data Repo
 
-A web app for storing personal messages with Ethereum wallet authentication using Sign-In with Ethereum (SIWE).
+A web app for storing key-value pairs with Ethereum wallet authentication using Sign-In with Ethereum (SIWE). Each key can be marked as public or private, with private keys requiring OAuth scopes for access.
 
 ## Features
 
 - **Ethereum Authentication**: Sign in with your Ethereum wallet using SIWE (EIP-4361)
-- **Data Ownership**: Messages are tied to your Ethereum address - only you can edit/delete your own messages
+- **Key-Value Storage**: Store arbitrary JSON data with user-defined keys
+- **Public/Private Visibility**: Mark keys as public (accessible without auth) or private
+- **Per-Key Scopes**: Private keys require `<key>:read` OAuth scope for external access
 - **Smart Contract Wallet Support**: EIP-1271 signature verification for Safe, Argent, etc.
 - **Persistent Storage**: SQLite database with Railway volume support
 
@@ -39,8 +41,8 @@ A web app for storing personal messages with Ethereum wallet authentication usin
 ┌─────────────────────────────────────────────────────────────┐
 │                     Hono API Server                         │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │  Auth       │  │  Messages   │  │  Vite Dev Server    │  │
-│  │  /api/auth  │  │  /api/...   │  │  (dev only)         │  │
+│  │  Auth       │  │  Key-Value  │  │  Vite Dev Server    │  │
+│  │  /api/auth  │  │  /api/keys  │  │  (dev only)         │  │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -48,7 +50,7 @@ A web app for storing personal messages with Ethereum wallet authentication usin
 ┌─────────────────────────────────────────────────────────────┐
 │                        SQLite                               │
 │  ┌─────────────┐  ┌─────────────┐                           │
-│  │  messages   │  │  nonces     │                           │
+│  │ key_values  │  │   nonces    │                           │
 │  └─────────────┘  └─────────────┘                           │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -75,8 +77,8 @@ sequenceDiagram
     App->>Server: POST /api/auth/token { message, signature }
     Server->>Server: Verify signature (EOA/EIP-1271)
     Server-->>App: { access_token, expires_in }
-    App->>Server: GET /api/messages (Bearer token)
-    Server-->>App: messages[]
+    App->>Server: GET /api/keys (Bearer token)
+    Server-->>App: keys[]
 ```
 
 1. User connects wallet (MetaMask, etc.)
@@ -90,7 +92,7 @@ sequenceDiagram
 
 ## Discoverable OAuth Flow (EIP-4361)
 
-For server-to-server API access, the `/api/authors/:address/messages` endpoint implements discoverable OAuth per the draft specification:
+For server-to-server API access, the `/user/:address/:key` endpoint implements discoverable OAuth for private keys:
 
 ```mermaid
 sequenceDiagram
@@ -98,52 +100,57 @@ sequenceDiagram
     participant Wallet
     participant Server
 
-    Client->>Server: GET /api/authors/:address/messages
-    Server-->>Client: 401 + WWW-Authenticate header
-    Note right of Client: Parse challenge:<br/>scope, token_uri,<br/>chain_id, signing_scheme
-    Client->>Server: GET /api/auth/nonce
-    Server-->>Client: { nonce }
-    Client->>Client: Build SIWE message with scopes
-    Client->>Wallet: Sign message
-    Wallet-->>Client: signature
-    Client->>Server: POST /api/auth/token<br/>{ grant_type: "eth_signature",<br/>message, signature, scope }
-    Server->>Server: Verify signature & scopes
-    Server-->>Client: { access_token, scope }
-    Client->>Server: GET /api/authors/:address/messages<br/>(Bearer token)
-    Server-->>Client: { author, messages[] }
+    Client->>Server: GET /user/:address/:key
+    alt Key is public
+        Server-->>Client: 200 { key, value }
+    else Key is private
+        Server-->>Client: 401 + WWW-Authenticate header
+        Note right of Client: Parse challenge:<br/>scope, token_uri,<br/>chain_id, signing_scheme
+        Client->>Server: GET /api/auth/nonce
+        Server-->>Client: { nonce }
+        Client->>Client: Build SIWE message with scopes
+        Client->>Wallet: Sign message
+        Wallet-->>Client: signature
+        Client->>Server: POST /api/auth/token<br/>{ grant_type: "eth_signature",<br/>message, signature, scope }
+        Server->>Server: Verify signature & scopes
+        Server-->>Client: { access_token, scope }
+        Client->>Server: GET /user/:address/:key<br/>(Bearer token)
+        Server-->>Client: { key, value }
+    end
 ```
 
 1. Client requests the endpoint without authentication
-2. Server responds with `401 Unauthorized` and `WWW-Authenticate` header:
+2. If the key is **public**, the value is returned immediately
+3. If the key is **private**, server responds with `401 Unauthorized` and `WWW-Authenticate` header:
    ```
-   WWW-Authenticate: Bearer, realm="author-messages", scope="messages:read",
+   WWW-Authenticate: Bearer, realm="kv-settings", scope="settings:read",
      token_uri="https://api.example.com/api/auth/token", chain_id="1", signing_scheme="eip4361"
    ```
-3. Client constructs a SIWE message with scopes in `resources` field:
+4. Client constructs a SIWE message with scopes in `resources` field:
    ```
    Resources:
-   - urn:oauth:scope:messages:read
+   - urn:oauth:scope:settings:read
    ```
-4. Client signs the message and exchanges for a token:
+5. Client signs the message and exchanges for a token:
    ```json
    POST /api/auth/token
    {
      "grant_type": "eth_signature",
      "message": "<SIWE message>",
      "signature": "0x...",
-     "scope": "messages:read"
+     "scope": "settings:read"
    }
    ```
-5. Server returns an OAuth-compatible token response:
+6. Server returns an OAuth-compatible token response:
    ```json
    {
      "access_token": "<jwt>",
      "token_type": "Bearer",
      "expires_in": 3600,
-     "scope": "messages:read"
+     "scope": "settings:read"
    }
    ```
-6. Client retries with `Authorization: Bearer <token>`
+7. Client retries with `Authorization: Bearer <token>`
 
 ## API Endpoints
 
@@ -152,21 +159,81 @@ sequenceDiagram
 - `GET /api/auth/nonce` - Get a fresh nonce for SIWE
 - `POST /api/auth/token` - Exchange signed SIWE message for JWT (supports `eth_signature` grant type)
 
-### Discoverable OAuth (returns WWW-Authenticate challenge)
+### Key-Value Access (Discoverable OAuth)
 
-- `GET /api/authors/:address/messages` - Get messages by author (requires `messages:read` scope)
+- `GET /user/:address/:key` - Get a value by owner address and key
+  - **Public keys**: Returns value without authentication
+  - **Private keys**: Returns `401` with `WWW-Authenticate` challenge requiring `<key>:read` scope
 
 ### Protected (requires Bearer token)
 
-- `GET /api/messages` - List all messages
-- `POST /api/messages` - Create a message
-- `PUT /api/messages/:id` - Update a message (owner only)
-- `DELETE /api/messages/:id` - Delete a message (owner only)
+- `GET /api/keys` - List all keys for authenticated user
+- `PUT /api/keys/:key` - Create or update a key-value pair
+- `DELETE /api/keys/:key` - Delete a key
+
+## Request/Response Examples
+
+### Create/Update a key
+
+```http
+PUT /api/keys/profile
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "value": {"name": "Alice", "bio": "Developer"},
+  "isPublic": true
+}
+```
+
+Response:
+```json
+{
+  "key": "profile",
+  "value": {"name": "Alice", "bio": "Developer"},
+  "isPublic": true,
+  "createdAt": "2024-01-01T00:00:00Z",
+  "updatedAt": "2024-01-01T00:00:00Z"
+}
+```
+
+### Get a public value (no auth required)
+
+```http
+GET /user/0xabc.../profile
+```
+
+Response:
+```json
+{
+  "key": "profile",
+  "value": {"name": "Alice", "bio": "Developer"},
+  "owner": "0xabc...",
+  "isPublic": true
+}
+```
+
+### Get a private value (auth required)
+
+```http
+GET /user/0xabc.../settings
+Authorization: Bearer <token with settings:read scope>
+```
+
+Response:
+```json
+{
+  "key": "settings",
+  "value": {"theme": "dark", "notifications": true},
+  "owner": "0xabc...",
+  "isPublic": false
+}
+```
 
 ## OAuth Scopes
 
-- `messages:read` - Read messages
-- `messages:write` - Create/update/delete messages
+- `<key>:read` - Read a specific private key (e.g., `profile:read`, `settings:read`)
+- `kv:write` - Create/update/delete keys (owner operations)
 
 ## Development
 

@@ -7,6 +7,9 @@ process.env.JWT_SECRET = "test-secret-for-vitest-at-least-32-chars";
 // Track consumed nonces in tests
 const consumedNonces = new Set<string>();
 
+// Mock key-value data store
+const mockKeyValues = new Map<string, { value: string; is_public: number }>();
+
 // Mock the db module (bun:sqlite not available in vitest)
 vi.mock("./db", () => ({
 	consumeNonce: vi.fn((nonce: string) => {
@@ -17,15 +20,19 @@ vi.mock("./db", () => ({
 		}
 		return false;
 	}),
-	getMessagesByAuthor: vi.fn((author: string) => [
-		{
-			id: 1,
-			content: "Test message",
-			author: author.toLowerCase(),
+	getKeyValue: vi.fn((owner: string, key: string) => {
+		const storeKey = `${owner.toLowerCase()}:${key}`;
+		const entry = mockKeyValues.get(storeKey);
+		if (!entry) return null;
+		return {
+			owner: owner.toLowerCase(),
+			key,
+			value: entry.value,
+			is_public: entry.is_public,
 			created_at: "2025-01-01T00:00:00Z",
 			updated_at: "2025-01-01T00:00:00Z",
-		},
-	]),
+		};
+	}),
 }));
 
 // Mock viem's createPublicClient
@@ -51,62 +58,109 @@ vi.mock("viem", async (importOriginal) => {
 });
 
 import {
-	createScopedAuthMiddleware,
+	createKeyValueAuthMiddleware,
 	exchangeToken,
 	SCOPES,
 	type TokenExchangeRequest,
 } from "./auth";
+import { getKeyValue } from "./db";
 
-describe("Discoverable OAuth API", () => {
+describe("Key-Value API", () => {
 	let app: Hono;
 
 	beforeEach(() => {
+		mockKeyValues.clear();
 		app = new Hono();
 
-		// Mount the discoverable endpoint
+		// Helper function to check key visibility using the mocked getKeyValue
+		function getKeyVisibility(owner: string, key: string): boolean | null {
+			const kv = getKeyValue(owner, key);
+			if (!kv) return null;
+			return kv.is_public === 1;
+		}
+
+		// Mount the key-value endpoint
 		app.get(
-			"/api/authors/:address/messages",
-			createScopedAuthMiddleware("author-messages", [SCOPES.MESSAGES_READ]),
+			"/user/:address/:key",
+			createKeyValueAuthMiddleware(getKeyVisibility),
 			(c) => {
-				const { getMessagesByAuthor } = require("./db");
-				const authorAddress = c.req.param("address").toLowerCase();
-				const messages = getMessagesByAuthor(authorAddress);
-				return c.json({ author: authorAddress, messages });
+				const ownerAddress = c.req.param("address").toLowerCase();
+				const key = c.req.param("key");
+				const kv = getKeyValue(ownerAddress, key);
+				if (!kv) {
+					return c.json({ error: "Key not found" }, 404);
+				}
+				return c.json({
+					key: kv.key,
+					value: JSON.parse(kv.value),
+					owner: kv.owner,
+					isPublic: kv.is_public === 1,
+				});
 			},
 		);
 	});
 
-	describe("GET /api/authors/:address/messages", () => {
-		it("returns 401 with WWW-Authenticate header when no auth provided", async () => {
-			const res = await app.request(
-				"/api/authors/0x1234567890abcdef1234567890abcdef12345678/messages",
-			);
+	describe("GET /user/:address/:key", () => {
+		it("returns public key without authentication", async () => {
+			const owner = "0x1234567890abcdef1234567890abcdef12345678";
+			mockKeyValues.set(`${owner.toLowerCase()}:profile`, {
+				value: JSON.stringify({ name: "Alice" }),
+				is_public: 1,
+			});
+
+			const res = await app.request(`/user/${owner}/profile`);
+
+			expect(res.status).toBe(200);
+			const body = await res.json();
+			expect(body.key).toBe("profile");
+			expect(body.value).toEqual({ name: "Alice" });
+			expect(body.isPublic).toBe(true);
+		});
+
+		it("returns 401 with WWW-Authenticate for private key without auth", async () => {
+			const owner = "0x1234567890abcdef1234567890abcdef12345678";
+			mockKeyValues.set(`${owner.toLowerCase()}:settings`, {
+				value: JSON.stringify({ theme: "dark" }),
+				is_public: 0,
+			});
+
+			const res = await app.request(`/user/${owner}/settings`);
 
 			expect(res.status).toBe(401);
 
 			const wwwAuth = res.headers.get("WWW-Authenticate");
 			expect(wwwAuth).toBeTruthy();
 			expect(wwwAuth).toContain("Bearer");
-			expect(wwwAuth).toContain('realm="author-messages"');
-			expect(wwwAuth).toContain('scope="messages:read"');
+			expect(wwwAuth).toContain('realm="kv-settings"');
+			expect(wwwAuth).toContain('scope="settings:read"');
 			expect(wwwAuth).toContain("token_uri=");
 			expect(wwwAuth).toContain('chain_id="1"');
 			expect(wwwAuth).toContain('signing_scheme="eip4361"');
 
 			const body = await res.json();
 			expect(body.error).toBe("unauthorized");
-			expect(body.error_description).toBe("Authentication required");
 		});
 
-		it("returns 401 with WWW-Authenticate header for invalid token", async () => {
-			const res = await app.request(
-				"/api/authors/0x1234567890abcdef1234567890abcdef12345678/messages",
-				{
-					headers: {
-						Authorization: "Bearer invalid-token",
-					},
+		it("returns 404 for non-existent key", async () => {
+			const owner = "0x1234567890abcdef1234567890abcdef12345678";
+
+			const res = await app.request(`/user/${owner}/nonexistent`);
+
+			expect(res.status).toBe(404);
+		});
+
+		it("returns 401 with WWW-Authenticate header for invalid token on private key", async () => {
+			const owner = "0x1234567890abcdef1234567890abcdef12345678";
+			mockKeyValues.set(`${owner.toLowerCase()}:settings`, {
+				value: JSON.stringify({ theme: "dark" }),
+				is_public: 0,
+			});
+
+			const res = await app.request(`/user/${owner}/settings`, {
+				headers: {
+					Authorization: "Bearer invalid-token",
 				},
-			);
+			});
 
 			expect(res.status).toBe(401);
 
@@ -130,7 +184,7 @@ describe("Token Exchange", () => {
 		let message = `localhost wants you to sign in with your Ethereum account:
 0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045
 
-Sign in to access your messages.
+Sign in to access your data.
 
 URI: http://localhost:3000
 Version: 1
@@ -187,34 +241,31 @@ Issued At: 2025-12-22T07:15:00Z`;
 		}
 	});
 
-	it("returns token with scopes from request body", async () => {
+	it("returns token with kv:write scope from request body", async () => {
 		const message = createSiweMessage({ nonce: "validnonce00002" });
 
 		const request: TokenExchangeRequest = {
 			grant_type: "eth_signature",
 			message,
 			signature: "0xvalid",
-			scope: "messages:read",
+			scope: "kv:write",
 		};
 
-		const result = await exchangeToken(request, [SCOPES.MESSAGES_READ]);
+		const result = await exchangeToken(request, [SCOPES.KV_WRITE]);
 
 		expect("error" in result).toBe(false);
 		if (!("error" in result)) {
 			expect(result.token).toBeTruthy();
 			expect(result.address).toBe("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
 			expect(result.chainId).toBe(1);
-			expect(result.scope).toBe("messages:read");
+			expect(result.scope).toBe("kv:write");
 		}
 	});
 
-	it("returns token with scopes from SIWE resources", async () => {
+	it("returns token with per-key read scope", async () => {
 		const message = createSiweMessage({
 			nonce: "validnonce00003",
-			resources: [
-				"urn:oauth:scope:messages:read",
-				"urn:oauth:scope:messages:write",
-			],
+			resources: ["urn:oauth:scope:profile:read"],
 		});
 
 		const request: TokenExchangeRequest = {
@@ -222,24 +273,23 @@ Issued At: 2025-12-22T07:15:00Z`;
 			signature: "0xvalid",
 		};
 
-		const result = await exchangeToken(request, [
-			SCOPES.MESSAGES_READ,
-			SCOPES.MESSAGES_WRITE,
-		]);
+		const result = await exchangeToken(request, [SCOPES.KV_WRITE]);
 
 		expect("error" in result).toBe(false);
 		if (!("error" in result)) {
 			expect(result.token).toBeTruthy();
-			expect(result.scope).toBe("messages:read messages:write");
+			// Dynamic read scopes are always allowed
+			expect(result.scope).toBe("profile:read");
 		}
 	});
 
-	it("filters out unauthorized scopes", async () => {
+	it("returns token with multiple scopes from SIWE resources", async () => {
 		const message = createSiweMessage({
 			nonce: "validnonce00004",
 			resources: [
-				"urn:oauth:scope:messages:read",
-				"urn:oauth:scope:messages:write",
+				"urn:oauth:scope:profile:read",
+				"urn:oauth:scope:settings:read",
+				"urn:oauth:scope:kv:write",
 			],
 		});
 
@@ -248,12 +298,12 @@ Issued At: 2025-12-22T07:15:00Z`;
 			signature: "0xvalid",
 		};
 
-		// Only allow messages:read
-		const result = await exchangeToken(request, [SCOPES.MESSAGES_READ]);
+		const result = await exchangeToken(request, [SCOPES.KV_WRITE]);
 
 		expect("error" in result).toBe(false);
 		if (!("error" in result)) {
-			expect(result.scope).toBe("messages:read");
+			expect(result.token).toBeTruthy();
+			expect(result.scope).toBe("profile:read settings:read kv:write");
 		}
 	});
 
@@ -277,15 +327,23 @@ Issued At: 2025-12-22T07:15:00Z`;
 });
 
 describe("WWW-Authenticate Challenge Format", () => {
-	it("conforms to RFC 6750 Bearer scheme", async () => {
+	it("conforms to RFC 6750 Bearer scheme for private keys", async () => {
 		const app = new Hono();
+
+		function getKeyVisibility(_owner: string, key: string): boolean | null {
+			if (key === "private-key") return false;
+			return null;
+		}
+
 		app.get(
-			"/test",
-			createScopedAuthMiddleware("test", [SCOPES.MESSAGES_READ]),
+			"/user/:address/:key",
+			createKeyValueAuthMiddleware(getKeyVisibility),
 			(c) => c.json({ ok: true }),
 		);
 
-		const res = await app.request("/test");
+		const res = await app.request(
+			"/user/0x1234567890abcdef1234567890abcdef12345678/private-key",
+		);
 		const wwwAuth = res.headers.get("WWW-Authenticate");
 
 		// Should start with Bearer scheme
@@ -299,5 +357,8 @@ describe("WWW-Authenticate Challenge Format", () => {
 		expect(wwwAuth).toMatch(/token_uri="[^"]+"/);
 		expect(wwwAuth).toMatch(/chain_id="[^"]+"/);
 		expect(wwwAuth).toMatch(/signing_scheme="eip4361"/);
+
+		// Should have per-key scope
+		expect(wwwAuth).toContain('scope="private-key:read"');
 	});
 });

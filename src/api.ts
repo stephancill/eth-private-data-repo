@@ -1,11 +1,11 @@
 import { getToken } from "./auth";
 
-export interface Message {
-	id: number;
-	content: string;
-	author: string;
-	created_at: string;
-	updated_at: string;
+export interface KeyValueEntry {
+	key: string;
+	value: unknown;
+	isPublic: boolean;
+	createdAt?: string;
+	updatedAt?: string;
 }
 
 const API_BASE = "/api";
@@ -19,45 +19,40 @@ function authHeaders(): HeadersInit {
 	};
 }
 
-export async function fetchMessages(): Promise<Message[]> {
-	const res = await fetch(`${API_BASE}/messages`, {
+export async function fetchKeys(): Promise<KeyValueEntry[]> {
+	const res = await fetch(`${API_BASE}/keys`, {
 		headers: authHeaders(),
 	});
 	if (res.status === 401) throw new Error("Unauthorized");
-	if (!res.ok) throw new Error("Failed to fetch messages");
+	if (!res.ok) throw new Error("Failed to fetch keys");
 	return res.json();
 }
 
-export async function createMessage(content: string): Promise<Message> {
-	const res = await fetch(`${API_BASE}/messages`, {
-		method: "POST",
-		headers: authHeaders(),
-		body: JSON.stringify({ content }),
-	});
-	if (res.status === 401) throw new Error("Unauthorized");
-	if (!res.ok) throw new Error("Failed to create message");
-	return res.json();
-}
-
-export async function updateMessage(
-	id: number,
-	content: string,
-): Promise<Message> {
-	const res = await fetch(`${API_BASE}/messages/${id}`, {
+export async function upsertKey(
+	key: string,
+	value: unknown,
+	isPublic: boolean,
+): Promise<KeyValueEntry> {
+	const res = await fetch(`${API_BASE}/keys/${encodeURIComponent(key)}`, {
 		method: "PUT",
 		headers: authHeaders(),
-		body: JSON.stringify({ content }),
+		body: JSON.stringify({ value, isPublic }),
 	});
 	if (res.status === 401) throw new Error("Unauthorized");
-	if (!res.ok) throw new Error("Failed to update message");
+	if (!res.ok) {
+		const error = await res
+			.json()
+			.catch(() => ({ error: "Failed to save key" }));
+		throw new Error(error.error || "Failed to save key");
+	}
 	return res.json();
 }
 
-export async function deleteMessage(id: number): Promise<void> {
-	const res = await fetch(`${API_BASE}/messages/${id}`, {
+export async function deleteKey(key: string): Promise<void> {
+	const res = await fetch(`${API_BASE}/keys/${encodeURIComponent(key)}`, {
 		method: "DELETE",
 		headers: authHeaders(),
 	});
 	if (res.status === 401) throw new Error("Unauthorized");
-	if (!res.ok) throw new Error("Failed to delete message");
+	if (!res.ok) throw new Error("Failed to delete key");
 }

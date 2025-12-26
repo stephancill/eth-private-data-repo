@@ -8,17 +8,19 @@ if (!existsSync(DATA_DIR)) {
 	mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const dbPath = `${DATA_DIR}/messages.db`;
+const dbPath = `${DATA_DIR}/data.db`;
 export const db = new Database(dbPath);
 
 // Initialize schema
 db.run(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content TEXT NOT NULL,
-    author TEXT NOT NULL,
+  CREATE TABLE IF NOT EXISTS key_values (
+    owner TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    is_public INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now'))
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (owner, key)
   )
 `);
 
@@ -29,56 +31,58 @@ db.run(`
   )
 `);
 
-export interface Message {
-	id: number;
-	content: string;
-	author: string;
+export interface KeyValue {
+	owner: string;
+	key: string;
+	value: string; // JSON-encoded
+	is_public: number;
 	created_at: string;
 	updated_at: string;
 }
 
-export function getAllMessages(): Message[] {
+export interface KeyValueInput {
+	key: string;
+	value: unknown; // Will be JSON-encoded
+	isPublic: boolean;
+}
+
+export function getAllKeysByOwner(owner: string): KeyValue[] {
 	return db
-		.query("SELECT * FROM messages ORDER BY created_at DESC")
-		.all() as Message[];
+		.query("SELECT * FROM key_values WHERE owner = ? ORDER BY key ASC")
+		.all(owner.toLowerCase()) as KeyValue[];
 }
 
-export function getMessagesByAuthor(author: string): Message[] {
+export function getKeyValue(owner: string, key: string): KeyValue | null {
 	return db
-		.query("SELECT * FROM messages WHERE author = ? ORDER BY created_at DESC")
-		.all(author.toLowerCase()) as Message[];
+		.query("SELECT * FROM key_values WHERE owner = ? AND key = ?")
+		.get(owner.toLowerCase(), key) as KeyValue | null;
 }
 
-export function getMessage(id: number): Message | null {
-	return db
-		.query("SELECT * FROM messages WHERE id = ?")
-		.get(id) as Message | null;
-}
-
-export function createMessage(content: string, author: string): Message {
-	const result = db
-		.query("INSERT INTO messages (content, author) VALUES (?, ?) RETURNING *")
-		.get(content, author.toLowerCase()) as Message;
-	return result;
-}
-
-export function updateMessage(
-	id: number,
-	content: string,
-	author: string,
-): Message | null {
+export function upsertKeyValue(
+	owner: string,
+	key: string,
+	value: unknown,
+	isPublic: boolean,
+): KeyValue {
+	const jsonValue = JSON.stringify(value);
 	const result = db
 		.query(
-			"UPDATE messages SET content = ?, updated_at = datetime('now') WHERE id = ? AND author = ? RETURNING *",
+			`INSERT INTO key_values (owner, key, value, is_public)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(owner, key) DO UPDATE SET
+			   value = excluded.value,
+			   is_public = excluded.is_public,
+			   updated_at = datetime('now')
+			 RETURNING *`,
 		)
-		.get(content, id, author.toLowerCase()) as Message | null;
+		.get(owner.toLowerCase(), key, jsonValue, isPublic ? 1 : 0) as KeyValue;
 	return result;
 }
 
-export function deleteMessage(id: number, author: string): boolean {
-	const result = db.run("DELETE FROM messages WHERE id = ? AND author = ?", [
-		id,
-		author.toLowerCase(),
+export function deleteKeyValue(owner: string, key: string): boolean {
+	const result = db.run("DELETE FROM key_values WHERE owner = ? AND key = ?", [
+		owner.toLowerCase(),
+		key,
 	]);
 	return result.changes > 0;
 }

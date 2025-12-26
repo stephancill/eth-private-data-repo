@@ -11,11 +11,24 @@ const DEFAULT_CHAIN_ID = 1;
 
 // OAuth scopes
 export const SCOPES = {
-	MESSAGES_READ: "messages:read",
-	MESSAGES_WRITE: "messages:write",
+	KV_WRITE: "kv:write",
 } as const;
 
-export type Scope = (typeof SCOPES)[keyof typeof SCOPES];
+export type StaticScope = (typeof SCOPES)[keyof typeof SCOPES];
+
+// Dynamic scope pattern for per-key read access: <key>:read
+export function makeReadScope(key: string): string {
+	return `${key}:read`;
+}
+
+export function isReadScope(scope: string): boolean {
+	return scope.endsWith(":read");
+}
+
+export function getKeyFromReadScope(scope: string): string | null {
+	if (!isReadScope(scope)) return null;
+	return scope.slice(0, -5); // Remove ":read" suffix
+}
 
 // Get JWT secret from environment
 function getJwtSecret(): Uint8Array {
@@ -43,7 +56,7 @@ interface TokenPayload extends JWTPayload {
 export function generateWWWAuthenticateChallenge(
 	c: Context,
 	realm: string,
-	scopes: Scope[],
+	scopes: string[],
 ): string {
 	const host = c.req.header("host") || "localhost";
 	const protocol = c.req.header("x-forwarded-proto") || "http";
@@ -68,13 +81,21 @@ export function parseScopesFromResources(resources?: string[]): string[] {
 		.map((r) => r.replace("urn:oauth:scope:", ""));
 }
 
-// Validate requested scopes against allowed scopes
+// Validate requested scopes - for dynamic scopes, we validate the format
 export function validateScopes(
 	requested: string[],
-	allowed: Scope[],
+	allowed: string[],
 ): string[] {
 	const allowedSet = new Set<string>(allowed);
-	return requested.filter((s) => allowedSet.has(s));
+	return requested.filter((s) => {
+		// Allow static scopes that are in the allowed set
+		if (allowedSet.has(s)) return true;
+		// Allow any <key>:read scope if "dynamic:read" is allowed or no restrictions
+		if (isReadScope(s) && (allowedSet.has("*:read") || allowed.length === 0)) {
+			return true;
+		}
+		return false;
+	});
 }
 
 async function createToken(payload: TokenPayload): Promise<string> {
@@ -114,7 +135,7 @@ export interface TokenExchangeError {
 
 export async function exchangeToken(
 	request: TokenExchangeRequest,
-	allowedScopes?: Scope[],
+	allowedScopes?: string[],
 ): Promise<TokenExchangeSuccess | TokenExchangeError> {
 	try {
 		const { message, signature, scope: requestedScope } = request;
@@ -163,10 +184,21 @@ export async function exchangeToken(
 			? requestedScope.split(" ")
 			: scopesFromResources;
 
-		// Validate scopes if allowed scopes are specified
-		const grantedScopes = allowedScopes
-			? validateScopes(requestedScopes, allowedScopes)
-			: requestedScopes;
+		// For token exchange, we allow:
+		// - kv:write (static scope)
+		// - Any <key>:read scope (dynamic scopes)
+		let grantedScopes: string[];
+		if (allowedScopes) {
+			grantedScopes = requestedScopes.filter((s) => {
+				// Static scopes must be in allowed list
+				if (allowedScopes.includes(s)) return true;
+				// Dynamic read scopes are always allowed (format validated)
+				if (isReadScope(s)) return true;
+				return false;
+			});
+		} else {
+			grantedScopes = requestedScopes;
+		}
 
 		const address = parsed.address.toLowerCase();
 		const chainId = parsed.chainId || DEFAULT_CHAIN_ID;
@@ -185,7 +217,7 @@ export async function exchangeToken(
 	}
 }
 
-// Auth middleware
+// Auth middleware for protected routes (owner operations)
 export const authMiddleware = createMiddleware<{
 	Variables: { address: string; chainId: number; scopes: string[] };
 }>(async (c, next) => {
@@ -209,27 +241,55 @@ export const authMiddleware = createMiddleware<{
 	await next();
 });
 
-// Create a scoped auth middleware that returns WWW-Authenticate challenge
-export function createScopedAuthMiddleware(
-	realm: string,
-	requiredScopes: Scope[],
+// Create a middleware for the /user/:address/:key endpoint
+// This handles both public and private key access with dynamic scopes
+export function createKeyValueAuthMiddleware(
+	getKeyVisibility: (owner: string, key: string) => boolean | null,
 ) {
 	return createMiddleware<{
-		Variables: { address: string; chainId: number; scopes: string[] };
+		Variables: {
+			address: string | null;
+			chainId: number | null;
+			scopes: string[];
+		};
 	}>(async (c, next) => {
+		const ownerAddress = c.req.param("address")?.toLowerCase();
+		const key = c.req.param("key");
+
+		if (!ownerAddress || !key) {
+			return c.json({ error: "Missing address or key" }, 400);
+		}
+
+		// Check if the key exists and its visibility
+		const isPublic = getKeyVisibility(ownerAddress, key);
+
+		if (isPublic === null) {
+			// Key doesn't exist
+			return c.json({ error: "Key not found" }, 404);
+		}
+
+		if (isPublic) {
+			// Public key - no auth needed
+			c.set("address", null);
+			c.set("chainId", null);
+			c.set("scopes", []);
+			await next();
+			return;
+		}
+
+		// Private key - requires authentication with specific scope
+		const requiredScope = makeReadScope(key);
 		const authHeader = c.req.header("Authorization");
 
 		if (!authHeader?.startsWith("Bearer ")) {
-			const challenge = generateWWWAuthenticateChallenge(
-				c,
-				realm,
-				requiredScopes,
-			);
+			const challenge = generateWWWAuthenticateChallenge(c, `kv-${key}`, [
+				requiredScope,
+			]);
 			c.header("WWW-Authenticate", challenge);
 			return c.json(
 				{
 					error: "unauthorized",
-					error_description: "Authentication required",
+					error_description: "Authentication required for private key",
 				},
 				401,
 			);
@@ -239,11 +299,9 @@ export function createScopedAuthMiddleware(
 		const payload = await verifyToken(token);
 
 		if (!payload) {
-			const challenge = generateWWWAuthenticateChallenge(
-				c,
-				realm,
-				requiredScopes,
-			);
+			const challenge = generateWWWAuthenticateChallenge(c, `kv-${key}`, [
+				requiredScope,
+			]);
 			c.header("WWW-Authenticate", challenge);
 			return c.json(
 				{
@@ -254,23 +312,20 @@ export function createScopedAuthMiddleware(
 			);
 		}
 
-		// Check if token has required scopes
+		// Check if token has the required scope OR if requester is the owner
 		const tokenScopes = payload.scope ? payload.scope.split(" ") : [];
-		const hasRequiredScopes = requiredScopes.every((s) =>
-			tokenScopes.includes(s),
-		);
+		const isOwner = payload.address.toLowerCase() === ownerAddress;
+		const hasRequiredScope = tokenScopes.includes(requiredScope);
 
-		if (!hasRequiredScopes) {
-			const challenge = generateWWWAuthenticateChallenge(
-				c,
-				realm,
-				requiredScopes,
-			);
+		if (!hasRequiredScope && !isOwner) {
+			const challenge = generateWWWAuthenticateChallenge(c, `kv-${key}`, [
+				requiredScope,
+			]);
 			c.header("WWW-Authenticate", challenge);
 			return c.json(
 				{
 					error: "insufficient_scope",
-					error_description: `Required scopes: ${requiredScopes.join(" ")}`,
+					error_description: `Required scope: ${requiredScope}`,
 				},
 				403,
 			);

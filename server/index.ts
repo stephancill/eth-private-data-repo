@@ -3,18 +3,17 @@ import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import {
 	authMiddleware,
-	createScopedAuthMiddleware,
+	createKeyValueAuthMiddleware,
 	exchangeToken,
 	SCOPES,
 	type TokenExchangeRequest,
 } from "./auth";
 import {
-	createMessage,
 	createNonce,
-	deleteMessage,
-	getMessage,
-	getMessagesByAuthor,
-	updateMessage,
+	deleteKeyValue,
+	getAllKeysByOwner,
+	getKeyValue,
+	upsertKeyValue,
 } from "./db";
 
 const app = new Hono();
@@ -22,6 +21,15 @@ const app = new Hono();
 // CORS for development
 app.use(
 	"/api/*",
+	cors({
+		origin: "*",
+		exposeHeaders: ["WWW-Authenticate"],
+	}),
+);
+
+// Also enable CORS for /user/* endpoint
+app.use(
+	"/user/*",
 	cors({
 		origin: "*",
 		exposeHeaders: ["WWW-Authenticate"],
@@ -47,8 +55,8 @@ app.post("/api/auth/token", async (c) => {
 		return c.json({ error: "unsupported_grant_type" }, 400);
 	}
 
-	// All scopes are allowed by default at the token endpoint
-	const allowedScopes = [SCOPES.MESSAGES_READ, SCOPES.MESSAGES_WRITE];
+	// Allow kv:write and any <key>:read scopes
+	const allowedScopes = [SCOPES.KV_WRITE];
 	const result = await exchangeToken(body, allowedScopes);
 
 	if ("error" in result) {
@@ -63,84 +71,108 @@ app.post("/api/auth/token", async (c) => {
 	});
 });
 
-// Discoverable OAuth endpoint for author messages
-// Returns 401 with WWW-Authenticate challenge when unauthenticated
-const authorsApi = new Hono<{
-	Variables: { address: string; chainId: number; scopes: string[] };
+// Public key-value access endpoint with discoverable OAuth
+// GET /user/:address/:key
+const userApi = new Hono<{
+	Variables: {
+		address: string | null;
+		chainId: number | null;
+		scopes: string[];
+	};
 }>();
 
-authorsApi.get(
-	"/:address/messages",
-	createScopedAuthMiddleware("author-messages", [SCOPES.MESSAGES_READ]),
+// Helper function to check key visibility
+function getKeyVisibility(owner: string, key: string): boolean | null {
+	const kv = getKeyValue(owner, key);
+	if (!kv) return null;
+	return kv.is_public === 1;
+}
+
+userApi.get(
+	"/:address/:key",
+	createKeyValueAuthMiddleware(getKeyVisibility),
 	(c) => {
-		const authorAddress = c.req.param("address").toLowerCase();
-		const messages = getMessagesByAuthor(authorAddress);
+		const ownerAddress = c.req.param("address").toLowerCase();
+		const key = c.req.param("key");
+
+		const kv = getKeyValue(ownerAddress, key);
+		if (!kv) {
+			return c.json({ error: "Key not found" }, 404);
+		}
+
 		return c.json({
-			author: authorAddress,
-			messages,
+			key: kv.key,
+			value: JSON.parse(kv.value),
+			owner: kv.owner,
+			isPublic: kv.is_public === 1,
 		});
 	},
 );
 
-app.route("/api/authors", authorsApi);
+app.route("/user", userApi);
 
-// Protected API routes
+// Protected API routes (owner operations)
 const api = new Hono<{
 	Variables: { address: string; chainId: number; scopes: string[] };
 }>();
 api.use("*", authMiddleware);
 
-api.get("/messages", (c) => {
-	// Return only the authenticated user's messages
+// List all keys for authenticated user
+api.get("/keys", (c) => {
 	const address = c.get("address");
-	const messages = getMessagesByAuthor(address);
-	return c.json(messages);
+	const keys = getAllKeysByOwner(address);
+	return c.json(
+		keys.map((kv) => ({
+			key: kv.key,
+			value: JSON.parse(kv.value),
+			isPublic: kv.is_public === 1,
+			createdAt: kv.created_at,
+			updatedAt: kv.updated_at,
+		})),
+	);
 });
 
-api.get("/messages/:id", (c) => {
-	const id = parseInt(c.req.param("id"), 10);
-	const message = getMessage(id);
-	if (!message) {
-		return c.json({ error: "Message not found" }, 404);
+// Create or update a key-value pair
+api.put("/keys/:key", async (c) => {
+	const key = c.req.param("key");
+	const body = await c.req.json<{ value: unknown; isPublic?: boolean }>();
+	const owner = c.get("address");
+
+	if (body.value === undefined) {
+		return c.json({ error: "Value is required" }, 400);
 	}
-	return c.json(message);
+
+	// Validate key format (alphanumeric, hyphens, underscores)
+	if (!/^[a-zA-Z0-9_-]+$/.test(key)) {
+		return c.json(
+			{
+				error:
+					"Invalid key format. Use alphanumeric characters, hyphens, and underscores only.",
+			},
+			400,
+		);
+	}
+
+	const isPublic = body.isPublic ?? false;
+	const kv = upsertKeyValue(owner, key, body.value, isPublic);
+
+	return c.json({
+		key: kv.key,
+		value: JSON.parse(kv.value),
+		isPublic: kv.is_public === 1,
+		createdAt: kv.created_at,
+		updatedAt: kv.updated_at,
+	});
 });
 
-api.post("/messages", async (c) => {
-	const body = await c.req.json<{ content: string }>();
-	const author = c.get("address");
+// Delete a key
+api.delete("/keys/:key", (c) => {
+	const key = c.req.param("key");
+	const owner = c.get("address");
 
-	if (!body.content?.trim()) {
-		return c.json({ error: "Content is required" }, 400);
-	}
-
-	const message = createMessage(body.content.trim(), author);
-	return c.json(message, 201);
-});
-
-api.put("/messages/:id", async (c) => {
-	const id = parseInt(c.req.param("id"), 10);
-	const body = await c.req.json<{ content: string }>();
-	const author = c.get("address");
-
-	if (!body.content?.trim()) {
-		return c.json({ error: "Content is required" }, 400);
-	}
-
-	const message = updateMessage(id, body.content.trim(), author);
-	if (!message) {
-		return c.json({ error: "Message not found or not authorized" }, 404);
-	}
-	return c.json(message);
-});
-
-api.delete("/messages/:id", (c) => {
-	const id = parseInt(c.req.param("id"), 10);
-	const author = c.get("address");
-
-	const deleted = deleteMessage(id, author);
+	const deleted = deleteKeyValue(owner, key);
 	if (!deleted) {
-		return c.json({ error: "Message not found or not authorized" }, 404);
+		return c.json({ error: "Key not found" }, 404);
 	}
 	return c.json({ success: true });
 });
