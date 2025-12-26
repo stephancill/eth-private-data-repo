@@ -18,21 +18,15 @@ import {
 
 const app = new Hono();
 
-// CORS for development
+// CORS for cross-origin API access
 app.use(
-	"/api/*",
+	"*",
 	cors({
 		origin: "*",
+		allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+		allowHeaders: ["Content-Type", "Authorization"],
 		exposeHeaders: ["WWW-Authenticate"],
-	}),
-);
-
-// Also enable CORS for /user/* endpoint
-app.use(
-	"/user/*",
-	cors({
-		origin: "*",
-		exposeHeaders: ["WWW-Authenticate"],
+		maxAge: 86400,
 	}),
 );
 
