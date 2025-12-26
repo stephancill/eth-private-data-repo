@@ -90,12 +90,7 @@ describe("Key-Value API", () => {
 				if (!kv) {
 					return c.json({ error: "Key not found" }, 404);
 				}
-				return c.json({
-					key: kv.key,
-					value: JSON.parse(kv.value),
-					owner: kv.owner,
-					isPublic: kv.is_public === 1,
-				});
+				return c.json(JSON.parse(kv.value));
 			},
 		);
 	});
@@ -112,9 +107,7 @@ describe("Key-Value API", () => {
 
 			expect(res.status).toBe(200);
 			const body = await res.json();
-			expect(body.key).toBe("profile");
-			expect(body.value).toEqual({ name: "Alice" });
-			expect(body.isPublic).toBe(true);
+			expect(body).toEqual({ name: "Alice" });
 		});
 
 		it("returns 401 with WWW-Authenticate for private key without auth", async () => {
