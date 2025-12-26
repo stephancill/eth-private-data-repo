@@ -310,7 +310,8 @@ function App() {
 								<div
 									style={{ marginBottom: 8, fontSize: "0.85em", opacity: 0.6 }}
 								>
-									URL: /user/{address.toLowerCase()}/{entry.key}
+									{window.location.origin}/user/{address.toLowerCase()}/
+									{entry.key}
 								</div>
 							)}
 							<button type="button" onClick={() => startEdit(entry)}>
