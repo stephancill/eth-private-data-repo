@@ -94,7 +94,7 @@ userApi.get(
       return c.json({ error: "Key not found" }, 404);
     }
 
-    return c.json(JSON.parse(kv.value));
+    return c.text(JSON.parse(kv.value));
   }
 );
 
